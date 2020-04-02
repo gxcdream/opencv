@@ -25,7 +25,7 @@ used.
 Second param is boolean variable, crossCheck which is false by default. If it is true, Matcher
 returns only those matches with value (i,j) such that i-th descriptor in set A has j-th descriptor
 in set B as the best match and vice-versa. That is, the two features in both sets should match each
-other. It provides consistant result, and is a good alternative to ratio test proposed by D.Lowe in
+other. It provides consistent result, and is a good alternative to ratio test proposed by D.Lowe in
 SIFT paper.
 
 Once it is created, two important methods are *BFMatcher.match()* and *BFMatcher.knnMatch()*. First
@@ -38,13 +38,13 @@ best matches. There is also **cv.drawMatchesKnn** which draws all the k best mat
 will draw two match-lines for each keypoint. So we have to pass a mask if we want to selectively
 draw it.
 
-Let's see one example for each of SURF and ORB (Both use different distance measurements).
+Let's see one example for each of SIFT and ORB (Both use different distance measurements).
 
 ### Brute-Force Matching with ORB Descriptors
 
 Here, we will see a simple example on how to match features between two images. In this case, I have
 a queryImage and a trainImage. We will try to find the queryImage in trainImage using feature
-matching. ( The images are /samples/c/box.png and /samples/c/box_in_scene.png)
+matching. ( The images are /samples/data/box.png and /samples/data/box_in_scene.png)
 
 We are using ORB descriptors to match features. So let's start with loading images, finding
 descriptors etc.
@@ -53,8 +53,8 @@ import numpy as np
 import cv2 as cv
 import matplotlib.pyplot as plt
 
-img1 = cv.imread('box.png',0)          # queryImage
-img2 = cv.imread('box_in_scene.png',0) # trainImage
+img1 = cv.imread('box.png',cv.IMREAD_GRAYSCALE)          # queryImage
+img2 = cv.imread('box_in_scene.png',cv.IMREAD_GRAYSCALE) # trainImage
 
 # Initiate ORB detector
 orb = cv.ORB_create()
@@ -79,7 +79,7 @@ matches = bf.match(des1,des2)
 matches = sorted(matches, key = lambda x:x.distance)
 
 # Draw first 10 matches.
-img3 = cv.drawMatches(img1,kp1,img2,kp2,matches[:10], flags=2)
+img3 = cv.drawMatches(img1,kp1,img2,kp2,matches[:10],None,flags=cv.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
 
 plt.imshow(img3),plt.show()
 @endcode
@@ -104,13 +104,13 @@ so that we can apply ratio test explained by D.Lowe in his paper.
 @code{.py}
 import numpy as np
 import cv2 as cv
-from matplotlib import pyplot as plt
+import matplotlib.pyplot as plt
 
-img1 = cv.imread('box.png',0)          # queryImage
-img2 = cv.imread('box_in_scene.png',0) # trainImage
+img1 = cv.imread('box.png',cv.IMREAD_GRAYSCALE)          # queryImage
+img2 = cv.imread('box_in_scene.png',cv.IMREAD_GRAYSCALE) # trainImage
 
 # Initiate SIFT detector
-sift = cv.SIFT()
+sift = cv.xfeatures2d.SIFT_create()
 
 # find the keypoints and descriptors with SIFT
 kp1, des1 = sift.detectAndCompute(img1,None)
@@ -118,7 +118,7 @@ kp2, des2 = sift.detectAndCompute(img2,None)
 
 # BFMatcher with default params
 bf = cv.BFMatcher()
-matches = bf.knnMatch(des1,des2, k=2)
+matches = bf.knnMatch(des1,des2,k=2)
 
 # Apply ratio test
 good = []
@@ -127,7 +127,7 @@ for m,n in matches:
         good.append([m])
 
 # cv.drawMatchesKnn expects list of lists as matches.
-img3 = cv.drawMatchesKnn(img1,kp1,img2,kp2,good,flags=2)
+img3 = cv.drawMatchesKnn(img1,kp1,img2,kp2,good,None,flags=cv.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
 
 plt.imshow(img3),plt.show()
 @endcode
@@ -164,17 +164,17 @@ Second dictionary is the SearchParams. It specifies the number of times the tree
 should be recursively traversed. Higher values gives better precision, but also takes more time. If
 you want to change the value, pass search_params = dict(checks=100).
 
-With these informations, we are good to go.
+With this information, we are good to go.
 @code{.py}
 import numpy as np
 import cv2 as cv
-from matplotlib import pyplot as plt
+import matplotlib.pyplot as plt
 
-img1 = cv.imread('box.png',0)          # queryImage
-img2 = cv.imread('box_in_scene.png',0) # trainImage
+img1 = cv.imread('box.png',cv.IMREAD_GRAYSCALE)          # queryImage
+img2 = cv.imread('box_in_scene.png',cv.IMREAD_GRAYSCALE) # trainImage
 
 # Initiate SIFT detector
-sift = cv.SIFT()
+sift = cv.xfeatures2d.SIFT_create()
 
 # find the keypoints and descriptors with SIFT
 kp1, des1 = sift.detectAndCompute(img1,None)
@@ -190,7 +190,7 @@ flann = cv.FlannBasedMatcher(index_params,search_params)
 matches = flann.knnMatch(des1,des2,k=2)
 
 # Need to draw only good matches, so create a mask
-matchesMask = [[0,0] for i in xrange(len(matches))]
+matchesMask = [[0,0] for i in range(len(matches))]
 
 # ratio test as per Lowe's paper
 for i,(m,n) in enumerate(matches):
@@ -200,7 +200,7 @@ for i,(m,n) in enumerate(matches):
 draw_params = dict(matchColor = (0,255,0),
                    singlePointColor = (255,0,0),
                    matchesMask = matchesMask,
-                   flags = 0)
+                   flags = cv.DrawMatchesFlags_DEFAULT)
 
 img3 = cv.drawMatchesKnn(img1,kp1,img2,kp2,matches,None,**draw_params)
 

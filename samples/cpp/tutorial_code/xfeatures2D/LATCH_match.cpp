@@ -4,10 +4,12 @@
 
 #ifdef HAVE_OPENCV_XFEATURES2D
 
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/highgui.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/xfeatures2d.hpp>
 #include <opencv2/imgcodecs.hpp>
-#include <opencv2/opencv.hpp>
 #include <vector>
 
 // If you find this code useful, please add a reference to the following paper in your work:
@@ -22,14 +24,14 @@ const float nn_match_ratio = 0.8f;   // Nearest neighbor matching ratio
 int main(int argc, char* argv[])
 {
     CommandLineParser parser(argc, argv,
-                             "{@img1 | ../data/graf1.png | input image 1}"
-                             "{@img2 | ../data/graf3.png | input image 2}"
-                             "{@homography | ../data/H1to3p.xml | homography matrix}");
-    Mat img1 = imread(parser.get<String>("@img1"), IMREAD_GRAYSCALE);
-    Mat img2 = imread(parser.get<String>("@img2"), IMREAD_GRAYSCALE);
+                             "{@img1 | graf1.png | input image 1}"
+                             "{@img2 | graf3.png | input image 2}"
+                             "{@homography | H1to3p.xml | homography matrix}");
+    Mat img1 = imread( samples::findFile( parser.get<String>("@img1") ), IMREAD_GRAYSCALE);
+    Mat img2 = imread( samples::findFile( parser.get<String>("@img2") ), IMREAD_GRAYSCALE);
 
     Mat homography;
-    FileStorage fs(parser.get<String>("@homography"), FileStorage::READ);
+    FileStorage fs( samples::findFile( parser.get<String>("@homography") ), FileStorage::READ);
     fs.getFirstTopLevelNode() >> homography;
 
     vector<KeyPoint> kpts1, kpts2;

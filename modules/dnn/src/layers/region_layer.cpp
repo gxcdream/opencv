@@ -41,22 +41,34 @@
 //M*/
 
 #include "../precomp.hpp"
+#include "../op_cuda.hpp"
 #include <opencv2/dnn/shape_utils.hpp>
 #include <opencv2/dnn/all_layers.hpp>
-#include "nms.inl.hpp"
+#include "../nms.inl.hpp"
+
+#ifdef HAVE_OPENCL
 #include "opencl_kernels_dnn.hpp"
+#endif
+
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/region.hpp"
+using namespace cv::dnn::cuda4dnn;
+#endif
 
 namespace cv
 {
 namespace dnn
 {
 
-class RegionLayerImpl : public RegionLayer
+class RegionLayerImpl CV_FINAL : public RegionLayer
 {
 public:
     int coords, classes, anchors, classfix;
     float thresh, nmsThreshold;
-    bool useSoftmaxTree, useSoftmax;
+    bool useSoftmax, useLogistic;
+#ifdef HAVE_OPENCL
+    UMat blob_umat;
+#endif
 
     RegionLayerImpl(const LayerParams& params)
     {
@@ -68,31 +80,39 @@ public:
         classes = params.get<int>("classes", 0);
         anchors = params.get<int>("anchors", 5);
         classfix = params.get<int>("classfix", 0);
-        useSoftmaxTree = params.get<bool>("softmax_tree", false);
         useSoftmax = params.get<bool>("softmax", false);
+        useLogistic = params.get<bool>("logistic", false);
         nmsThreshold = params.get<float>("nms_threshold", 0.4);
 
         CV_Assert(nmsThreshold >= 0.);
         CV_Assert(coords == 4);
         CV_Assert(classes >= 1);
         CV_Assert(anchors >= 1);
-        CV_Assert(useSoftmaxTree || useSoftmax);
+        CV_Assert(useLogistic || useSoftmax);
+        if (params.get<bool>("softmax_tree", false))
+            CV_Error(cv::Error::StsNotImplemented, "Yolo9000 is not implemented");
+    }
+
+    virtual bool supportBackend(int backendId) CV_OVERRIDE
+    {
+        return backendId == DNN_BACKEND_OPENCV ||
+               backendId == DNN_BACKEND_CUDA;
     }
 
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
                          const int requiredOutputs,
                          std::vector<MatShape> &outputs,
-                         std::vector<MatShape> &internals) const
+                         std::vector<MatShape> &internals) const CV_OVERRIDE
     {
         CV_Assert(inputs.size() > 0);
+        // channels == cell_size*anchors
         CV_Assert(inputs[0][3] == (1 + coords + classes)*anchors);
-        outputs = std::vector<MatShape>(inputs.size(), shape(inputs[0][1] * inputs[0][2] * anchors, inputs[0][3] / anchors));
+        int batch_size = inputs[0][0];
+        if(batch_size > 1)
+            outputs = std::vector<MatShape>(1, shape(batch_size, inputs[0][1] * inputs[0][2] * anchors, inputs[0][3] / anchors));
+        else
+            outputs = std::vector<MatShape>(1, shape(inputs[0][1] * inputs[0][2] * anchors, inputs[0][3] / anchors));
         return false;
-    }
-
-    virtual bool supportBackend(int backendId)
-    {
-        return backendId == DNN_BACKEND_DEFAULT;
     }
 
     float logistic_activate(float x) { return 1.F / (1.F + exp(-x)); }
@@ -118,44 +138,49 @@ public:
 #ifdef HAVE_OPENCL
     bool forward_ocl(InputArrayOfArrays inps, OutputArrayOfArrays outs, OutputArrayOfArrays internals)
     {
+        if (blob_umat.empty())
+            blobs[0].copyTo(blob_umat);
+
         std::vector<UMat> inputs;
         std::vector<UMat> outputs;
+
+        // TODO: implement a logistic activation to classification scores.
+        if (useLogistic || inps.depth() == CV_16S)
+            return false;
 
         inps.getUMatVector(inputs);
         outs.getUMatVector(outputs);
 
-        if (useSoftmaxTree) {   // Yolo 9000
-            CV_Error(cv::Error::StsNotImplemented, "Yolo9000 is not implemented");
-            return false;
-        }
-
         CV_Assert(inputs.size() >= 1);
         int const cell_size = classes + coords + 1;
-        UMat blob_umat = blobs[0].getUMat(ACCESS_READ);
 
         for (size_t ii = 0; ii < outputs.size(); ii++)
         {
             UMat& inpBlob = inputs[ii];
             UMat& outBlob = outputs[ii];
 
+            int batch_size = inpBlob.size[0];
             int rows = inpBlob.size[1];
             int cols = inpBlob.size[2];
 
+            // channels == cell_size*anchors, see l. 94
+            int sample_size = cell_size*rows*cols*anchors;
+
             ocl::Kernel logistic_kernel("logistic_activ", ocl::dnn::region_oclsrc);
-            size_t global = rows*cols*anchors;
-            logistic_kernel.set(0, (int)global);
+            size_t nanchors = rows*cols*anchors*batch_size;
+            logistic_kernel.set(0, (int)nanchors);
             logistic_kernel.set(1, ocl::KernelArg::PtrReadOnly(inpBlob));
             logistic_kernel.set(2, (int)cell_size);
             logistic_kernel.set(3, ocl::KernelArg::PtrWriteOnly(outBlob));
-            logistic_kernel.run(1, &global, NULL, false);
+            logistic_kernel.run(1, &nanchors, NULL, false);
 
             if (useSoftmax)
             {
                 // Yolo v2
                 // softmax activation for Probability, for each grid cell (X x Y x Anchor-index)
                 ocl::Kernel softmax_kernel("softmax_activ", ocl::dnn::region_oclsrc);
-                size_t nthreads = rows*cols*anchors;
-                softmax_kernel.set(0, (int)nthreads);
+                size_t nanchors = rows*cols*anchors*batch_size;
+                softmax_kernel.set(0, (int)nanchors);
                 softmax_kernel.set(1, ocl::KernelArg::PtrReadOnly(inpBlob));
                 softmax_kernel.set(2, ocl::KernelArg::PtrReadOnly(blob_umat));
                 softmax_kernel.set(3, (int)cell_size);
@@ -166,14 +191,15 @@ public:
                 softmax_kernel.set(8, (int)anchors);
                 softmax_kernel.set(9, (float)thresh);
                 softmax_kernel.set(10, ocl::KernelArg::PtrWriteOnly(outBlob));
-                if (!softmax_kernel.run(1, &nthreads, NULL, false))
+                if (!softmax_kernel.run(1, &nanchors, NULL, false))
                     return false;
             }
 
             if (nmsThreshold > 0) {
                 Mat mat = outBlob.getMat(ACCESS_WRITE);
                 float *dstData = mat.ptr<float>();
-                do_nms_sort(dstData, rows*cols*anchors, thresh, nmsThreshold);
+                for (int b = 0; b < batch_size; ++b)
+                    do_nms_sort(dstData + b*sample_size, rows*cols*anchors, thresh, nmsThreshold);
             }
 
         }
@@ -182,105 +208,115 @@ public:
     }
 #endif
 
-    void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr)
+    void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
     {
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
-        CV_OCL_RUN((preferableTarget == DNN_TARGET_OPENCL) &&
-                   OCL_PERFORMANCE_CHECK(ocl::Device::getDefault().isIntel()),
+        CV_OCL_RUN(IS_DNN_OPENCL_TARGET(preferableTarget),
                    forward_ocl(inputs_arr, outputs_arr, internals_arr))
 
-        Layer::forward_fallback(inputs_arr, outputs_arr, internals_arr);
-    }
+        if (inputs_arr.depth() == CV_16S)
+        {
+            forward_fallback(inputs_arr, outputs_arr, internals_arr);
+            return;
+        }
 
-    void forward(std::vector<Mat*> &inputs, std::vector<Mat> &outputs, std::vector<Mat> &internals)
-    {
-        CV_TRACE_FUNCTION();
-        CV_TRACE_ARG_VALUE(name, "name", name.c_str());
+        std::vector<Mat> inputs, outputs, internals;
+        inputs_arr.getMatVector(inputs);
+        outputs_arr.getMatVector(outputs);
+        internals_arr.getMatVector(internals);
 
         CV_Assert(inputs.size() >= 1);
+        CV_Assert(outputs.size() == 1);
         int const cell_size = classes + coords + 1;
 
         const float* biasData = blobs[0].ptr<float>();
 
         for (size_t ii = 0; ii < outputs.size(); ii++)
         {
-            Mat &inpBlob = *inputs[ii];
+            Mat &inpBlob = inputs[ii];
             Mat &outBlob = outputs[ii];
 
+            int batch_size = inpBlob.size[0];
             int rows = inpBlob.size[1];
             int cols = inpBlob.size[2];
+
+            // address length for one image in batch, both for input and output
+            int sample_size = cell_size*rows*cols*anchors;
+
+            // assert that the comment above is true
+            CV_Assert(sample_size*batch_size == inpBlob.total());
+            CV_Assert(sample_size*batch_size == outBlob.total());
+
+            CV_Assert(inputs.size() < 2 || inputs[1].dims == 4);
+            int hNorm = inputs.size() > 1 ? inputs[1].size[2] : rows;
+            int wNorm = inputs.size() > 1 ? inputs[1].size[3] : cols;
 
             const float *srcData = inpBlob.ptr<float>();
             float *dstData = outBlob.ptr<float>();
 
             // logistic activation for t0, for each grid cell (X x Y x Anchor-index)
-            for (int i = 0; i < rows*cols*anchors; ++i) {
+            for (int i = 0; i < batch_size*rows*cols*anchors; ++i) {
                 int index = cell_size*i;
                 float x = srcData[index + 4];
                 dstData[index + 4] = logistic_activate(x);	// logistic activation
             }
 
-            if (useSoftmaxTree) {   // Yolo 9000
-                CV_Error(cv::Error::StsNotImplemented, "Yolo9000 is not implemented");
-            }
-            else if (useSoftmax) {  // Yolo v2
-                // softmax activation for Probability, for each grid cell (X x Y x Anchor-index)
-                for (int i = 0; i < rows*cols*anchors; ++i) {
+            if (useSoftmax) {  // Yolo v2
+                for (int i = 0; i < batch_size*rows*cols*anchors; ++i) {
                     int index = cell_size*i;
                     softmax_activate(srcData + index + 5, classes, 1, dstData + index + 5);
                 }
-
+            }
+            else if (useLogistic) {  // Yolo v3
+                for (int i = 0; i < batch_size*rows*cols*anchors; ++i){
+                    int index = cell_size*i;
+                    const float* input = srcData + index + 5;
+                    float* output = dstData + index + 5;
+                    for (int c = 0; c < classes; ++c)
+                        output[c] = logistic_activate(input[c]);
+                }
+            }
+            for (int b = 0; b < batch_size; ++b)
                 for (int x = 0; x < cols; ++x)
                     for(int y = 0; y < rows; ++y)
                         for (int a = 0; a < anchors; ++a) {
-                            int index = (y*cols + x)*anchors + a;	// index for each grid-cell & anchor
-                            int p_index = index * cell_size + 4;
+                            // relative start address for image b within the batch data
+                            int index_sample_offset = sample_size*b;
+                            int index = (y*cols + x)*anchors + a;  // index for each grid-cell & anchor
+                            int p_index = index_sample_offset + index * cell_size + 4;
                             float scale = dstData[p_index];
-                            if (classfix == -1 && scale < .5) scale = 0;	// if(t0 < 0.5) t0 = 0;
-                            int box_index = index * cell_size;
+                            if (classfix == -1 && scale < .5) scale = 0;  // if(t0 < 0.5) t0 = 0;
+                            int box_index = index_sample_offset + index * cell_size;
 
                             dstData[box_index + 0] = (x + logistic_activate(srcData[box_index + 0])) / cols;
                             dstData[box_index + 1] = (y + logistic_activate(srcData[box_index + 1])) / rows;
-                            dstData[box_index + 2] = exp(srcData[box_index + 2]) * biasData[2 * a] / cols;
-                            dstData[box_index + 3] = exp(srcData[box_index + 3]) * biasData[2 * a + 1] / rows;
+                            dstData[box_index + 2] = exp(srcData[box_index + 2]) * biasData[2 * a] / wNorm;
+                            dstData[box_index + 3] = exp(srcData[box_index + 3]) * biasData[2 * a + 1] / hNorm;
 
-                            int class_index = index * cell_size + 5;
-
-                            if (useSoftmaxTree) {
-                                CV_Error(cv::Error::StsNotImplemented, "Yolo9000 is not implemented");
-                            }
-                            else {
-                                for (int j = 0; j < classes; ++j) {
-                                    float prob = scale*dstData[class_index + j];	// prob = IoU(box, object) = t0 * class-probability
-                                    dstData[class_index + j] = (prob > thresh) ? prob : 0;		// if (IoU < threshold) IoU = 0;
-                                }
+                            int class_index = index_sample_offset + index * cell_size + 5;
+                            for (int j = 0; j < classes; ++j) {
+                                float prob = scale*dstData[class_index + j];  // prob = IoU(box, object) = t0 * class-probability
+                                dstData[class_index + j] = (prob > thresh) ? prob : 0;  // if (IoU < threshold) IoU = 0;
                             }
                         }
-
-            }
-
             if (nmsThreshold > 0) {
-                do_nms_sort(dstData, rows*cols*anchors, thresh, nmsThreshold);
+                for (int b = 0; b < batch_size; ++b){
+                    do_nms_sort(dstData+b*sample_size, rows*cols*anchors, thresh, nmsThreshold);
+                }
             }
-
         }
-    }
-
-    static inline float rectOverlap(const Rect2f& a, const Rect2f& b)
-    {
-        return 1.0f - jaccardDistance(a, b);
     }
 
     void do_nms_sort(float *detections, int total, float score_thresh, float nms_thresh)
     {
-        std::vector<Rect2f> boxes(total);
+        std::vector<Rect2d> boxes(total);
         std::vector<float> scores(total);
 
         for (int i = 0; i < total; ++i)
         {
-            Rect2f &b = boxes[i];
+            Rect2d &b = boxes[i];
             int box_index = i * (classes + coords + 1);
             b.width = detections[box_index + 2];
             b.height = detections[box_index + 3];
@@ -298,7 +334,7 @@ public:
                 scores[i] = detections[class_index + k];
                 detections[class_index + k] = 0;
             }
-            NMSFast_(boxes, scores, score_thresh, nms_thresh, 1, 0, indices, rectOverlap);
+            NMSBoxes(boxes, scores, score_thresh, nms_thresh, indices);
             for (int i = 0, n = indices.size(); i < n; ++i)
             {
                 int box_index = indices[i] * (classes + coords + 1);
@@ -308,10 +344,65 @@ public:
         }
     }
 
-    virtual int64 getFLOPS(const std::vector<MatShape> &inputs,
-                           const std::vector<MatShape> &outputs) const
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(
+        void *context_,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs
+    ) override
     {
-        (void)outputs; // suppress unused variable warning
+        auto context = reinterpret_cast<csl::CSLContext*>(context_);
+
+        if (coords != 4)
+            CV_Error(Error::StsNotImplemented, "Only upright rectangular boxes are supported in RegionLayer.");
+
+        std::size_t height_norm, width_norm;
+        if (inputs.size() == 1)
+        {
+            auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
+            auto input_shape = input_wrapper->getShape();
+            height_norm = input_shape[1];
+            width_norm = input_shape[2];
+        }
+        else
+        {
+            auto input_wrapper = inputs[1].dynamicCast<CUDABackendWrapper>();
+            auto input_shape = input_wrapper->getShape();
+            CV_Assert(input_shape.size() == 4);
+            height_norm = input_shape[2];
+            width_norm = input_shape[3];
+        }
+
+        cuda4dnn::SquashMethod squash_method;
+        if(useLogistic)
+            squash_method = cuda4dnn::SquashMethod::SIGMOID;
+        else if (useSoftmax)
+            squash_method = cuda4dnn::SquashMethod::SOFTMAX;
+
+        /* exactly one must be true */
+        CV_Assert((useLogistic || useSoftmax) && !(useLogistic && useSoftmax));
+
+        cuda4dnn::RegionConfiguration<float> config;
+        config.squash_method = squash_method;
+        config.classes = classes;
+        config.boxes_per_cell = anchors;
+
+        config.height_norm = height_norm;
+        config.width_norm = width_norm;
+
+        config.object_prob_cutoff = (classfix == -1) ? 0.5 : 0.0;
+        config.class_prob_cutoff = thresh;
+
+        config.nms_iou_threshold = nmsThreshold;
+
+        return make_cuda_node<cuda4dnn::RegionOp>(preferableTarget, std::move(context->stream), blobs[0], config);
+    }
+#endif
+
+    virtual int64 getFLOPS(const std::vector<MatShape> &inputs,
+                           const std::vector<MatShape> &outputs) const CV_OVERRIDE
+    {
+        CV_UNUSED(outputs); // suppress unused variable warning
 
         int64 flops = 0;
         for(int i = 0; i < inputs.size(); i++)

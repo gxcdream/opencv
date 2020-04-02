@@ -6,10 +6,9 @@
 #include "opencv2/ts/ocl_perf.hpp"
 
 #ifdef HAVE_OPENCL
-#ifdef HAVE_VIDEO_INPUT
 #include "../perf_bgfg_utils.hpp"
 
-namespace cvtest {
+namespace opencv_test {
 namespace ocl {
 
 //////////////////////////// Mog2//////////////////////////
@@ -32,7 +31,8 @@ OCL_PERF_TEST_P(MOG2_Apply, Mog2, Combine(Values("gpu/video/768x576.avi", "gpu/v
     vector<Mat> frame_buffer(nFrame);
 
     cv::VideoCapture cap(inputFile);
-    ASSERT_TRUE(cap.isOpened());
+    if (!cap.isOpened())
+        throw SkipTestException("Video file can not be opened");
     prepareData(cap, cn, frame_buffer);
 
     UMat u_foreground;
@@ -65,7 +65,8 @@ OCL_PERF_TEST_P(MOG2_GetBackgroundImage, Mog2, Values(
     vector<Mat> frame_buffer(nFrame);
 
     cv::VideoCapture cap(inputFile);
-    ASSERT_TRUE(cap.isOpened());
+    if (!cap.isOpened())
+        throw SkipTestException("Video file can not be opened");
     prepareData(cap, cn, frame_buffer, skipFrames);
 
     UMat u_foreground, u_background;
@@ -89,7 +90,6 @@ OCL_PERF_TEST_P(MOG2_GetBackgroundImage, Mog2, Values(
     SANITY_CHECK_NOTHING();
 }
 
-}}// namespace cvtest::ocl
+}}// namespace opencv_test::ocl
 
-#endif
 #endif

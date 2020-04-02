@@ -16,32 +16,22 @@
 //#define CV_LOG_STRIP_LEVEL CV_LOG_LEVEL_VERBOSE + 1
 #include <opencv2/core/utils/logger.hpp>
 
+#include <opencv2/core/utils/trace.private.hpp>
+
 //#define CV_PROFILE_THREADS 64
 //#define getTickCount getCPUTickCount  // use this if getTickCount() calls are expensive (and getCPUTickCount() is accurate)
 
 //#define CV_USE_GLOBAL_WORKERS_COND_VAR  // not effective on many-core systems (10+)
 
-#ifdef CV_CXX11
 #include <atomic>
-#else
-#include <unistd.h>  // _POSIX_PRIORITY_SCHEDULING
-#endif
 
 // Spin lock's OS-level yield
 #ifdef DECLARE_CV_YIELD
 DECLARE_CV_YIELD
 #endif
 #ifndef CV_YIELD
-# ifdef CV_CXX11
-#   include <thread>
-#   define CV_YIELD() std::this_thread::yield()
-# elif defined(_POSIX_PRIORITY_SCHEDULING)
-#   include <sched.h>
-#   define CV_YIELD() sched_yield()
-# else
-#   warning "Can't detect sched_yield() on the target platform. Specify CV_YIELD() definition via compiler flags."
-#   define CV_YIELD() /* no-op: works, but not effective */
-# endif
+# include <thread>
+# define CV_YIELD() std::this_thread::yield()
 #endif // CV_YIELD
 
 // Spin lock's CPU-level yield (required for Hyper-Threading)
@@ -49,12 +39,18 @@ DECLARE_CV_YIELD
 DECLARE_CV_PAUSE
 #endif
 #ifndef CV_PAUSE
-#if defined __GNUC__ && (defined __i386__ || defined __x86_64__)
+# if defined __GNUC__ && (defined __i386__ || defined __x86_64__)
+#   if !defined(__SSE2__)
+      static inline void cv_non_sse_mm_pause() { __asm__ __volatile__ ("rep; nop"); }
+#     define _mm_pause cv_non_sse_mm_pause
+#   endif
 #   define CV_PAUSE(v) do { for (int __delay = (v); __delay > 0; --__delay) { _mm_pause(); } } while (0)
 # elif defined __GNUC__ && defined __aarch64__
 #   define CV_PAUSE(v) do { for (int __delay = (v); __delay > 0; --__delay) { asm volatile("yield" ::: "memory"); } } while (0)
 # elif defined __GNUC__ && defined __arm__
 #   define CV_PAUSE(v) do { for (int __delay = (v); __delay > 0; --__delay) { asm volatile("" ::: "memory"); } } while (0)
+# elif defined __GNUC__ && defined __mips__ && __mips_isa_rev >= 2
+#   define CV_PAUSE(v) do { for (int __delay = (v); __delay > 0; --__delay) { asm volatile("pause" ::: "memory"); } } while (0)
 # elif defined __GNUC__ && defined __PPC64__
 #   define CV_PAUSE(v) do { for (int __delay = (v); __delay > 0; --__delay) { asm volatile("or 27,27,27" ::: "memory"); } } while (0)
 # else
@@ -190,14 +186,13 @@ class WorkerThread
 {
 public:
     ThreadPool& thread_pool;
-    unsigned id;
+    const unsigned id;
     pthread_t posix_thread;
     bool is_created;
 
-    volatile bool stop_thread;
+    std::atomic<bool> stop_thread;
 
-    volatile bool has_wake_signal;
-    volatile bool dont_wait;
+    std::atomic<bool> has_wake_signal;
 
     Ptr<ParallelJob> job;
 
@@ -213,8 +208,7 @@ public:
         posix_thread(0),
         is_created(false),
         stop_thread(false),
-        has_wake_signal(false),
-        dont_wait(false)
+        has_wake_signal(false)
 #if !defined(CV_USE_GLOBAL_WORKERS_COND_VAR)
         , isActive(true)
 #endif
@@ -272,6 +266,9 @@ public:
     void thread_body();
     static void* thread_loop_wrapper(void* thread_object)
     {
+#ifdef OPENCV_WITH_ITT
+        __itt_thread_set_name(cv::format("OpenCVThread-%03d", cv::utils::getThreadID()).c_str());
+#endif
         ((WorkerThread*)thread_object)->thread_body();
         return 0;
     }
@@ -288,15 +285,9 @@ public:
         is_completed(false)
     {
         CV_LOG_VERBOSE(NULL, 5, "ParallelJob::ParallelJob(" << (void*)this << ")");
-#ifdef CV_CXX11
         current_task.store(0, std::memory_order_relaxed);
         active_thread_count.store(0, std::memory_order_relaxed);
         completed_thread_count.store(0, std::memory_order_relaxed);
-#else
-        current_task = 0;
-        active_thread_count = 0;
-        completed_thread_count = 0;
-#endif
         dummy0_[0] = 0, dummy1_[0] = 0, dummy2_[0] = 0; // compiler warning
     }
 
@@ -317,11 +308,7 @@ public:
         for (;;)
         {
             int chunk_size = std::max(1, (task_count - current_task) / remaining_multiplier);
-#ifdef CV_CXX11
             int id = current_task.fetch_add(chunk_size, std::memory_order_seq_cst);
-#else
-            int id = (int)CV_XADD(&current_task, chunk_size);
-#endif
             if (id >= task_count)
                 break; // no more free tasks
 
@@ -347,7 +334,7 @@ public:
     const ParallelLoopBody& body;
     const Range range;
     const unsigned nstripes;
-#ifdef CV_CXX11
+
     std::atomic<int> current_task;  // next free part of job
     int64 dummy0_[8];  // avoid cache-line reusing for the same atomics
 
@@ -356,18 +343,8 @@ public:
 
     std::atomic<int> completed_thread_count;  // number of threads completed any activities on this job
     int64 dummy2_[8];  // avoid cache-line reusing for the same atomics
-#else
-    /*CV_DECL_ALIGNED(64)*/ volatile int current_task;  // next free part of job
-    int64 dummy0_[8];  // avoid cache-line reusing for the same atomics
 
-    /*CV_DECL_ALIGNED(64)*/ volatile int active_thread_count;  // number of threads worked on this job
-    int64 dummy1_[8];  // avoid cache-line reusing for the same atomics
-
-    /*CV_DECL_ALIGNED(64)*/ volatile int completed_thread_count;  // number of threads completed any activities on this job
-    int64 dummy2_[8];  // avoid cache-line reusing for the same atomics
-#endif
-
-    volatile bool is_completed;  // std::atomic_flag ?
+    std::atomic<bool> is_completed;
 
     // TODO exception handling
 };
@@ -386,7 +363,7 @@ void WorkerThread::thread_body()
 
     while (!stop_thread)
     {
-        CV_LOG_VERBOSE(NULL, 5, "Thread: ... loop iteration: allow_active_wait=" << allow_active_wait << "   has_wake_signal=" << has_wake_signal << "   dont_wait=" << dont_wait   );
+        CV_LOG_VERBOSE(NULL, 5, "Thread: ... loop iteration: allow_active_wait=" << allow_active_wait << "   has_wake_signal=" << has_wake_signal);
         if (allow_active_wait && CV_WORKER_ACTIVE_WAIT > 0)
         {
             allow_active_wait = false;
@@ -404,7 +381,7 @@ void WorkerThread::thread_body()
 #ifdef CV_PROFILE_THREADS
         stat.threadWait = getTickCount();
 #endif
-        while (!has_wake_signal && !dont_wait) // to handle spurious wakeups
+        while (!has_wake_signal) // to handle spurious wakeups
         {
             //CV_LOG_VERBOSE(NULL, 5, "Thread: wait (sleep) ...");
 #if defined(CV_USE_GLOBAL_WORKERS_COND_VAR)
@@ -416,30 +393,26 @@ void WorkerThread::thread_body()
 #endif
             CV_LOG_VERBOSE(NULL, 5, "Thread: wake ... (has_wake_signal=" << has_wake_signal << " stop_thread=" << stop_thread << ")")
         }
-        dont_wait = false;
 #ifdef CV_PROFILE_THREADS
         stat.threadWake = getTickCount();
 #endif
 
+        CV_LOG_VERBOSE(NULL, 5, "Thread: checking for new job");
+        if (CV_WORKER_ACTIVE_WAIT_THREADS_LIMIT == 0)
+            allow_active_wait = true;
+        Ptr<ParallelJob> j_ptr; swap(j_ptr, job);
+        has_wake_signal = false;
+        pthread_mutex_unlock(&mutex);
+
         if (!stop_thread)
         {
-            CV_LOG_VERBOSE(NULL, 5, "Thread: checking for new job");
-            if (CV_WORKER_ACTIVE_WAIT_THREADS_LIMIT == 0)
-                allow_active_wait = true;
-            Ptr<ParallelJob> j_ptr; swap(j_ptr, job);
-            has_wake_signal = false;
-            pthread_mutex_unlock(&mutex);
             ParallelJob* j = j_ptr;
             if (j)
             {
                 CV_LOG_VERBOSE(NULL, 5, "Thread: job size=" << j->range.size() << " done=" << j->current_task);
                 if (j->current_task < j->range.size())
                 {
-#ifdef CV_CXX11
                     int other = j->active_thread_count.fetch_add(1, std::memory_order_seq_cst);
-#else
-                    int other = CV_XADD(&j->active_thread_count, 1);
-#endif
                     CV_LOG_VERBOSE(NULL, 5, "Thread: processing new job (with " << other << " other threads)"); CV_UNUSED(other);
 #ifdef CV_PROFILE_THREADS
                     stat.threadExecuteStart = getTickCount();
@@ -448,13 +421,8 @@ void WorkerThread::thread_body()
 #else
                     j->execute(true);
 #endif
-#ifdef CV_CXX11
                     int completed = j->completed_thread_count.fetch_add(1, std::memory_order_seq_cst) + 1;
                     int active = j->active_thread_count.load(std::memory_order_acquire);
-#else
-                    int completed = (int)CV_XADD(&j->completed_thread_count, 1) + 1;
-                    int active = j->active_thread_count;
-#endif
                     if (CV_WORKER_ACTIVE_WAIT_THREADS_LIMIT > 0)
                     {
                         allow_active_wait = true;
@@ -479,14 +447,9 @@ void WorkerThread::thread_body()
                 }
                 else
                 {
-                    has_wake_signal = false;
                     CV_LOG_VERBOSE(NULL, 5, "Thread: no free job tasks");
                 }
             }
-        }
-        else
-        {
-            pthread_mutex_unlock(&mutex);
         }
 #ifdef CV_PROFILE_THREADS
         stat.threadFree = getTickCount();
@@ -599,42 +562,42 @@ void ThreadPool::run(const Range& range, const ParallelLoopBody& body, double ns
             CV_LOG_VERBOSE(NULL, 5, "MainThread: wake worker threads...");
             for (size_t i = 0; i < threads.size(); ++i)
             {
+                WorkerThread& thread = *(threads[i].get());
+                if (
 #if !defined(CV_USE_GLOBAL_WORKERS_COND_VAR)
-                bool isActive = threads[i]->isActive;
-                if (isActive || threads[i]->has_wake_signal)
-#else
-                if (threads[i]->has_wake_signal)
+                        thread.isActive ||
 #endif
+                        thread.has_wake_signal
+                        || !thread.job.empty()  // #10881
+                )
                 {
-                    pthread_mutex_lock(&threads[i]->mutex);
-                    threads[i]->job = job;
+                    pthread_mutex_lock(&thread.mutex);
+                    thread.job = job;
 #if !defined(CV_USE_GLOBAL_WORKERS_COND_VAR)
-                    isActive = threads[i]->isActive;
+                    bool isActive = thread.isActive;
 #endif
-                    threads[i]->dont_wait = true;
+                    thread.has_wake_signal = true;
 #ifdef CV_PROFILE_THREADS
                     threads_stat[i + 1].reset();
 #endif
-                    pthread_mutex_unlock(&threads[i]->mutex);
-                    threads[i]->has_wake_signal = true;
+                    pthread_mutex_unlock(&thread.mutex);
 #if !defined(CV_USE_GLOBAL_WORKERS_COND_VAR)
                     if (!isActive)
                     {
-                        pthread_cond_broadcast/*pthread_cond_signal*/(&threads[i]->cond_thread_wake); // wake thread
+                        pthread_cond_broadcast/*pthread_cond_signal*/(&thread.cond_thread_wake); // wake thread
                     }
 #endif
                 }
                 else
                 {
-                    CV_Assert(threads[i]->job.empty());
-                    threads[i]->job = job;
-                    threads[i]->dont_wait = true;
-                    threads[i]->has_wake_signal = true;
+                    CV_Assert(thread.job.empty());
+                    thread.job = job;
+                    thread.has_wake_signal = true;
 #ifdef CV_PROFILE_THREADS
                     threads_stat[i + 1].reset();
 #endif
 #if !defined(CV_USE_GLOBAL_WORKERS_COND_VAR)
-                    pthread_cond_broadcast/*pthread_cond_signal*/(&threads[i]->cond_thread_wake); // wake thread
+                    pthread_cond_broadcast/*pthread_cond_signal*/(&thread.cond_thread_wake); // wake thread
 #endif
                 }
             }
@@ -736,7 +699,7 @@ void ThreadPool::setNumOfThreads(unsigned n)
     {
         num_threads = n;
         if (n == 1)
-           if (job == NULL) reconfigure(0);  // stop worker threads immediatelly
+           if (job == NULL) reconfigure(0);  // stop worker threads immediately
     }
 }
 

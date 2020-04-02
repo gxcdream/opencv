@@ -1,12 +1,98 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html
 #include "test_precomp.hpp"
 
-#include <fstream>
-#include <sstream>
-#include <iostream>
+namespace opencv_test { namespace {
 
-using namespace cv;
-using namespace std;
-using namespace cvtest;
+/* < <file_name, image_size>, <imread mode, scale> > */
+typedef tuple< tuple<string, Size>, tuple<ImreadModes, int> > Imgcodecs_Resize_t;
+
+typedef testing::TestWithParam< Imgcodecs_Resize_t > Imgcodecs_Resize;
+
+/* resize_flag_and_dims = <imread_flag, scale>*/
+const tuple <ImreadModes, int> resize_flag_and_dims[] =
+{
+    make_tuple(IMREAD_UNCHANGED, 1),
+    make_tuple(IMREAD_REDUCED_GRAYSCALE_2, 2),
+    make_tuple(IMREAD_REDUCED_GRAYSCALE_4, 4),
+    make_tuple(IMREAD_REDUCED_GRAYSCALE_8, 8),
+    make_tuple(IMREAD_REDUCED_COLOR_2, 2),
+    make_tuple(IMREAD_REDUCED_COLOR_4, 4),
+    make_tuple(IMREAD_REDUCED_COLOR_8, 8)
+};
+
+const tuple<string, Size> images[] =
+{
+#ifdef HAVE_JPEG
+    make_tuple<string, Size>("../cv/imgproc/stuff.jpg", Size(640, 480)),
+#endif
+#ifdef HAVE_PNG
+    make_tuple<string, Size>("../cv/shared/pic1.png", Size(400, 300)),
+#endif
+};
+
+TEST_P(Imgcodecs_Resize, imread_reduce_flags)
+{
+    const string file_name = findDataFile(get<0>(get<0>(GetParam())));
+    const Size imageSize = get<1>(get<0>(GetParam()));
+
+    const int imread_flag = get<0>(get<1>(GetParam()));
+    const int scale = get<1>(get<1>(GetParam()));
+
+    const int cols = imageSize.width / scale;
+    const int rows = imageSize.height / scale;
+    {
+        Mat img = imread(file_name, imread_flag);
+        ASSERT_FALSE(img.empty());
+        EXPECT_EQ(cols, img.cols);
+        EXPECT_EQ(rows, img.rows);
+    }
+}
+
+//==================================================================================================
+
+TEST_P(Imgcodecs_Resize, imdecode_reduce_flags)
+{
+    const string file_name = findDataFile(get<0>(get<0>(GetParam())));
+    const Size imageSize = get<1>(get<0>(GetParam()));
+
+    const int imread_flag = get<0>(get<1>(GetParam()));
+    const int scale = get<1>(get<1>(GetParam()));
+
+    const int cols = imageSize.width / scale;
+    const int rows = imageSize.height / scale;
+
+    const std::ios::openmode mode = std::ios::in | std::ios::binary;
+    std::ifstream ifs(file_name.c_str(), mode);
+    ASSERT_TRUE(ifs.is_open());
+
+    ifs.seekg(0, std::ios::end);
+    const size_t sz = static_cast<size_t>(ifs.tellg());
+    ifs.seekg(0, std::ios::beg);
+
+    std::vector<char> content(sz);
+    ifs.read((char*)content.data(), sz);
+    ASSERT_FALSE(ifs.fail());
+
+    {
+        Mat img = imdecode(Mat(content), imread_flag);
+        ASSERT_FALSE(img.empty());
+        EXPECT_EQ(cols, img.cols);
+        EXPECT_EQ(rows, img.rows);
+    }
+}
+
+//==================================================================================================
+
+INSTANTIATE_TEST_CASE_P(/*nothing*/, Imgcodecs_Resize,
+        testing::Combine(
+            testing::ValuesIn(images),
+            testing::ValuesIn(resize_flag_and_dims)
+            )
+        );
+
+//==================================================================================================
 
 TEST(Imgcodecs_Image, read_write_bmp)
 {
@@ -108,15 +194,20 @@ const string exts[] = {
 #ifdef HAVE_JPEG
     "jpg",
 #endif
-#ifdef HAVE_JASPER
+#if (defined(HAVE_JASPER) && defined(OPENCV_IMGCODECS_ENABLE_JASPER_TESTS)) \
+    || defined(HAVE_OPENJPEG)
     "jp2",
 #endif
 #if 0 /*defined HAVE_OPENEXR && !defined __APPLE__*/
     "exr",
 #endif
     "bmp",
+#ifdef HAVE_IMGCODEC_PXM
     "ppm",
-    "ras"
+#endif
+#ifdef HAVE_IMGCODEC_SUNRASTER
+    "ras",
+#endif
 };
 
 INSTANTIATE_TEST_CASE_P(imgcodecs, Imgcodecs_Image, testing::ValuesIn(exts));
@@ -129,3 +220,26 @@ TEST(Imgcodecs_Image, regression_9376)
     EXPECT_EQ(32, m.cols);
     EXPECT_EQ(32, m.rows);
 }
+
+//==================================================================================================
+
+TEST(Imgcodecs_Image, write_umat)
+{
+    const string src_name = TS::ptr()->get_data_path() + "../python/images/baboon.bmp";
+    const string dst_name = cv::tempfile(".bmp");
+
+    Mat image1 = imread(src_name);
+    ASSERT_FALSE(image1.empty());
+
+    UMat image1_umat = image1.getUMat(ACCESS_RW);
+
+    imwrite(dst_name, image1_umat);
+
+    Mat image2 = imread(dst_name);
+    ASSERT_FALSE(image2.empty());
+
+    EXPECT_PRED_FORMAT2(cvtest::MatComparator(0, 0), image1, image2);
+    EXPECT_EQ(0, remove(dst_name.c_str()));
+}
+
+}} // namespace

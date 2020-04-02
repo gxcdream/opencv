@@ -80,7 +80,7 @@ static void sigmoid(const Mat &src, Mat &dst)
     cv::pow(1 + dst, -1, dst);
 }
 
-class LSTMLayerImpl : public LSTMLayer
+class LSTMLayerImpl CV_FINAL : public LSTMLayer
 {
     int numTimeStamps, numSamples;
     bool allocated;
@@ -92,6 +92,8 @@ class LSTMLayerImpl : public LSTMLayer
     bool produceCellOutput;
     float forgetBias, cellClip;
     bool useCellClip, usePeephole;
+    bool reverse;   // If true, go in negative direction along the time axis
+    bool bidirectional;  // If true, produces both forward and reversed directions along time axis
 
 public:
 
@@ -100,6 +102,7 @@ public:
     {
         setParamsFrom(params);
 
+        bidirectional = params.get<bool>("bidirectional", false);
         if (!blobs.empty())
         {
             CV_Assert(blobs.size() >= 3);
@@ -109,19 +112,21 @@ public:
             const Mat& Wh = blobs[0];
             const Mat& Wx = blobs[1];
             const Mat& bias = blobs[2];
-            CV_Assert(Wh.dims == 2 && Wx.dims == 2);
-            CV_Assert(Wh.rows == Wx.rows);
-            CV_Assert(Wh.rows == 4*Wh.cols);
-            CV_Assert(Wh.rows == (int)bias.total());
+            CV_CheckEQ(Wh.dims, 2, "");
+            CV_CheckEQ(Wx.dims, 2, "");
+            CV_CheckEQ(Wh.rows, Wx.rows, "");
+            CV_CheckEQ(Wh.rows, (1 + static_cast<int>(bidirectional))*4*Wh.cols, "");
+            CV_CheckEQ(Wh.rows, (int)bias.total(), "");
             CV_Assert(Wh.type() == Wx.type() && Wx.type() == bias.type());
 
             // Peephole weights.
             if (blobs.size() > 3)
             {
                 CV_Assert(blobs.size() == 6);
+                const int N = Wh.cols;
                 for (int i = 3; i < 6; ++i)
                 {
-                    CV_Assert(blobs[i].rows == Wh.cols && blobs[i].cols == Wh.cols);
+                    CV_Assert(blobs[i].rows == N && blobs[i].cols == N);
                     CV_Assert(blobs[i].type() == bias.type());
                 }
             }
@@ -132,30 +137,32 @@ public:
         cellClip = params.get<float>("cell_clip", 0.0f);
         useCellClip = params.get<bool>("use_cell_clip", false);
         usePeephole = params.get<bool>("use_peephole", false);
+        reverse = params.get<bool>("reverse", false);
+        CV_Assert(!reverse || !bidirectional);
 
         allocated = false;
         outTailShape.clear();
     }
 
-    void setUseTimstampsDim(bool use)
+    void setUseTimstampsDim(bool use) CV_OVERRIDE
     {
         CV_Assert(!allocated);
         useTimestampDim = use;
     }
 
-    void setProduceCellOutput(bool produce)
+    void setProduceCellOutput(bool produce) CV_OVERRIDE
     {
         CV_Assert(!allocated);
         produceCellOutput = produce;
     }
 
-    void setOutShape(const MatShape &outTailShape_)
+    void setOutShape(const MatShape &outTailShape_) CV_OVERRIDE
     {
         CV_Assert(!allocated || total(outTailShape) == total(outTailShape_));
         outTailShape = outTailShape_;
     }
 
-    void setWeights(const Mat &Wh, const Mat &Wx, const Mat &bias)
+    void setWeights(const Mat &Wh, const Mat &Wx, const Mat &bias) CV_OVERRIDE
     {
         CV_Assert(Wh.dims == 2 && Wx.dims == 2);
         CV_Assert(Wh.rows == Wx.rows);
@@ -172,9 +179,9 @@ public:
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
                          const int requiredOutputs,
                          std::vector<MatShape> &outputs,
-                         std::vector<MatShape> &internals) const
+                         std::vector<MatShape> &internals) const CV_OVERRIDE
     {
-        CV_Assert(!usePeephole && blobs.size() == 3 || usePeephole && blobs.size() == 6);
+        CV_Assert((!usePeephole && blobs.size() == 3) || (usePeephole && blobs.size() == 6));
         CV_Assert(inputs.size() == 1);
         const MatShape& inp0 = inputs[0];
 
@@ -188,23 +195,22 @@ public:
         else
             outTailShape_.assign(1, _numOut);
 
-        int _numTimeStamps, _numSamples;
+        int _numSamples;
         if (useTimestampDim)
         {
             CV_Assert(inp0.size() >= 2 && total(inp0, 2) == _numInp);
-            _numTimeStamps = inp0[0];
             _numSamples = inp0[1];
-            outResShape.push_back(_numTimeStamps);
+            outResShape.push_back(inp0[0]);
         }
         else
         {
             CV_Assert(inp0.size() >= 2 && total(inp0, 1) == _numInp);
-            _numTimeStamps = 1;
             _numSamples = inp0[0];
         }
 
         outResShape.push_back(_numSamples);
         outResShape.insert(outResShape.end(), outTailShape_.begin(), outTailShape_.end());
+        outResShape.back() *= (1 + static_cast<int>(bidirectional));
 
         size_t noutputs = produceCellOutput ? 2 : 1;
         outputs.assign(noutputs, outResShape);
@@ -217,11 +223,14 @@ public:
         return false;
     }
 
-    void finalize(const std::vector<Mat*> &input, std::vector<Mat> &output)
+    void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays) CV_OVERRIDE
     {
-        CV_Assert(!usePeephole && blobs.size() == 3 || usePeephole && blobs.size() == 6);
+        std::vector<Mat> input;
+        inputs_arr.getMatVector(input);
+
+        CV_Assert((!usePeephole && blobs.size() == 3) || (usePeephole && blobs.size() == 6));
         CV_Assert(input.size() == 1);
-        const Mat& inp0 = *input[0];
+        const Mat& inp0 = input[0];
 
         Mat &Wh = blobs[0], &Wx = blobs[1];
         int numOut = Wh.size[1];
@@ -248,97 +257,117 @@ public:
         outTsShape.clear();
         outTsShape.push_back(numSamples);
         outTsShape.insert(outTsShape.end(), outTailShape.begin(), outTailShape.end());
+        outTsShape.back() *= (1 + static_cast<int>(bidirectional));
 
         allocated = true;
     }
 
-    void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr)
+    void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
     {
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
-        Layer::forward_fallback(inputs_arr, outputs_arr, internals_arr);
-    }
-
-    void forward(std::vector<Mat*> &input, std::vector<Mat> &output, std::vector<Mat> &internals)
-    {
-        CV_TRACE_FUNCTION();
-        CV_TRACE_ARG_VALUE(name, "name", name.c_str());
-
-        const Mat &Wh = blobs[0];
-        const Mat &Wx = blobs[1];
-        const Mat &bias = blobs[2];
-
-        int numOut = Wh.size[1];
-
-        Mat hInternal = internals[0], cInternal = internals[1],
-                dummyOnes = internals[2], gates = internals[3];
-        hInternal.setTo(0.);
-        cInternal.setTo(0.);
-        dummyOnes.setTo(1.);
-
-        int numSamplesTotal = numTimeStamps*numSamples;
-        Mat xTs = input[0]->reshape(1, numSamplesTotal);
-
-        Mat hOutTs = output[0].reshape(1, numSamplesTotal);
-        Mat cOutTs = produceCellOutput ? output[1].reshape(1, numSamplesTotal) : Mat();
-
-        for (int ts = 0; ts < numTimeStamps; ts++)
+        if (inputs_arr.depth() == CV_16S)
         {
-            Range curRowRange(ts*numSamples, (ts + 1)*numSamples);
-            Mat xCurr = xTs.rowRange(curRowRange);
+            forward_fallback(inputs_arr, outputs_arr, internals_arr);
+            return;
+        }
 
-            gemm(xCurr, Wx, 1, gates, 0, gates, GEMM_2_T);      // Wx * x_t
-            gemm(hInternal, Wh, 1, gates, 1, gates, GEMM_2_T);  //+Wh * h_{t-1}
-            gemm(dummyOnes, bias, 1, gates, 1, gates);          //+b
+        std::vector<Mat> input, output, internals;
+        inputs_arr.getMatVector(input);
+        outputs_arr.getMatVector(output);
+        internals_arr.getMatVector(internals);
 
-            Mat gateI = gates.colRange(0*numOut, 1*numOut);
-            Mat gateF = gates.colRange(1*numOut, 2*numOut);
-            Mat gateO = gates.colRange(2*numOut, 3*numOut);
-            Mat gateG = gates.colRange(3*numOut, 4*numOut);
+        const int numDirs = 1 + static_cast<int>(bidirectional);
+        for (int i = 0; i < numDirs; ++i)
+        {
+            const Mat &Wh = blobs[0].rowRange(i * blobs[0].rows / numDirs, (i + 1) * blobs[0].rows / numDirs);
+            const Mat &Wx = blobs[1].rowRange(i * blobs[1].rows / numDirs, (i + 1) * blobs[1].rows / numDirs);
+            const Mat &bias = blobs[2].colRange(i * blobs[2].cols / numDirs, (i + 1) * blobs[2].cols / numDirs);
 
-            if (forgetBias)
-                add(gateF, forgetBias, gateF);
+            int numOut = Wh.size[1];
 
-            if (usePeephole)
-            {
-                Mat gatesIF = gates.colRange(0, 2*numOut);
-                gemm(cInternal, blobs[3], 1, gateI, 1, gateI);
-                gemm(cInternal, blobs[4], 1, gateF, 1, gateF);
-                sigmoid(gatesIF, gatesIF);
+            Mat hInternal = internals[0], cInternal = internals[1],
+                    dummyOnes = internals[2], gates = internals[3];
+            hInternal.setTo(0.);
+            cInternal.setTo(0.);
+            dummyOnes.setTo(1.);
+
+            int numSamplesTotal = numTimeStamps*numSamples;
+            Mat xTs = input[0].reshape(1, numSamplesTotal);
+
+            Mat hOutTs = output[0].reshape(1, numSamplesTotal);
+            hOutTs = hOutTs.colRange(i * hOutTs.cols / numDirs, (i + 1) * hOutTs.cols / numDirs);
+            Mat cOutTs = produceCellOutput ? output[1].reshape(1, numSamplesTotal) : Mat();
+
+            int tsStart, tsEnd, tsInc;
+            if (reverse || i == 1) {
+                tsStart = numTimeStamps - 1;
+                tsEnd = -1;
+                tsInc = -1;
             }
-            else
-            {
-                Mat gatesIFO = gates.colRange(0, 3*numOut);
-                sigmoid(gatesIFO, gatesIFO);
+            else {
+                tsStart = 0;
+                tsEnd = numTimeStamps;
+                tsInc = 1;
             }
-
-            tanh(gateG, gateG);
-
-            //compute c_t
-            multiply(gateF, cInternal, gateF);  // f_t (*) c_{t-1}
-            multiply(gateI, gateG, gateI);      // i_t (*) g_t
-            add(gateF, gateI, cInternal);       // c_t = f_t (*) c_{t-1} + i_t (*) g_t
-
-            if (useCellClip)
+            for (int ts = tsStart; ts != tsEnd; ts += tsInc)
             {
-                min(cInternal, cellClip, cInternal);
-                max(cInternal, -cellClip, cInternal);
-            }
-            if (usePeephole)
-            {
-                gemm(cInternal, blobs[5], 1, gateO, 1, gateO);
-                sigmoid(gateO, gateO);
-            }
+                Range curRowRange(ts*numSamples, (ts + 1)*numSamples);
+                Mat xCurr = xTs.rowRange(curRowRange);
 
-            //compute h_t
-            tanh(cInternal, hInternal);
-            multiply(gateO, hInternal, hInternal);
+                gemm(xCurr, Wx, 1, gates, 0, gates, GEMM_2_T);      // Wx * x_t
+                gemm(hInternal, Wh, 1, gates, 1, gates, GEMM_2_T);  //+Wh * h_{t-1}
+                gemm(dummyOnes, bias, 1, gates, 1, gates);          //+b
 
-            //save results in output blobs
-            hInternal.copyTo(hOutTs.rowRange(curRowRange));
-            if (produceCellOutput)
-                cInternal.copyTo(cOutTs.rowRange(curRowRange));
+                Mat gateI = gates.colRange(0*numOut, 1*numOut);
+                Mat gateF = gates.colRange(1*numOut, 2*numOut);
+                Mat gateO = gates.colRange(2*numOut, 3*numOut);
+                Mat gateG = gates.colRange(3*numOut, 4*numOut);
+
+                if (forgetBias)
+                    add(gateF, forgetBias, gateF);
+
+                if (usePeephole)
+                {
+                    Mat gatesIF = gates.colRange(0, 2*numOut);
+                    gemm(cInternal, blobs[3], 1, gateI, 1, gateI);
+                    gemm(cInternal, blobs[4], 1, gateF, 1, gateF);
+                    sigmoid(gatesIF, gatesIF);
+                }
+                else
+                {
+                    Mat gatesIFO = gates.colRange(0, 3*numOut);
+                    sigmoid(gatesIFO, gatesIFO);
+                }
+
+                tanh(gateG, gateG);
+
+                //compute c_t
+                multiply(gateF, cInternal, gateF);  // f_t (*) c_{t-1}
+                multiply(gateI, gateG, gateI);      // i_t (*) g_t
+                add(gateF, gateI, cInternal);       // c_t = f_t (*) c_{t-1} + i_t (*) g_t
+
+                if (useCellClip)
+                {
+                    min(cInternal, cellClip, cInternal);
+                    max(cInternal, -cellClip, cInternal);
+                }
+                if (usePeephole)
+                {
+                    gemm(cInternal, blobs[5], 1, gateO, 1, gateO);
+                    sigmoid(gateO, gateO);
+                }
+
+                //compute h_t
+                tanh(cInternal, hInternal);
+                multiply(gateO, hInternal, hInternal);
+
+                //save results in output blobs
+                hInternal.copyTo(hOutTs.rowRange(curRowRange));
+                if (produceCellOutput)
+                    cInternal.copyTo(cOutTs.rowRange(curRowRange));
+            }
         }
     }
 };
@@ -350,16 +379,16 @@ Ptr<LSTMLayer> LSTMLayer::create(const LayerParams& params)
 
 int LSTMLayer::inputNameToIndex(String inputName)
 {
-    if (inputName.toLowerCase() == "x")
+    if (toLowerCase(inputName) == "x")
         return 0;
     return -1;
 }
 
-int LSTMLayer::outputNameToIndex(String outputName)
+int LSTMLayer::outputNameToIndex(const String& outputName)
 {
-    if (outputName.toLowerCase() == "h")
+    if (toLowerCase(outputName) == "h")
         return 0;
-    else if (outputName.toLowerCase() == "c")
+    else if (toLowerCase(outputName) == "c")
         return 1;
     return -1;
 }
@@ -384,12 +413,12 @@ public:
         produceH = false;
     }
 
-    void setProduceHiddenOutput(bool produce = false)
+    void setProduceHiddenOutput(bool produce = false) CV_OVERRIDE
     {
         produceH = produce;
     }
 
-    void setWeights(const Mat &W_xh, const Mat &b_h, const Mat &W_hh, const Mat &W_ho, const Mat &b_o)
+    void setWeights(const Mat &W_xh, const Mat &b_h, const Mat &W_hh, const Mat &W_ho, const Mat &b_o) CV_OVERRIDE
     {
         CV_Assert(W_hh.dims == 2 && W_xh.dims == 2);
         CV_Assert(W_hh.size[0] == W_xh.size[0] && W_hh.size[0] == W_hh.size[1] && (int)b_h.total() == W_xh.size[0]);
@@ -407,7 +436,7 @@ public:
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
                          const int requiredOutputs,
                          std::vector<MatShape> &outputs,
-                         std::vector<MatShape> &internals) const
+                         std::vector<MatShape> &internals) const CV_OVERRIDE
     {
         CV_Assert(inputs.size() >= 1 && inputs.size() <= 2);
 
@@ -433,8 +462,11 @@ public:
         return false;
     }
 
-    void finalize(const std::vector<Mat*> &input, std::vector<Mat> &output)
+    void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays) CV_OVERRIDE
     {
+        std::vector<Mat> input, outputs;
+        inputs_arr.getMatVector(input);
+
         CV_Assert(input.size() >= 1 && input.size() <= 2);
 
         Wxh = blobs[0];
@@ -447,7 +479,7 @@ public:
         numX = Wxh.cols;
         numO = Who.rows;
 
-        const Mat& inp0 = *input[0];
+        const Mat& inp0 = input[0];
 
         CV_Assert(inp0.dims >= 2);
         CV_Assert(inp0.total(2) == numX);
@@ -473,20 +505,23 @@ public:
         }
     }
 
-    void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr)
+    void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
     {
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
-        Layer::forward_fallback(inputs_arr, outputs_arr, internals_arr);
-    }
+        if (inputs_arr.depth() == CV_16S)
+        {
+            forward_fallback(inputs_arr, outputs_arr, internals_arr);
+            return;
+        }
 
-    void forward(std::vector<Mat*> &input, std::vector<Mat> &output, std::vector<Mat> &internals)
-    {
-        CV_TRACE_FUNCTION();
-        CV_TRACE_ARG_VALUE(name, "name", name.c_str());
+        std::vector<Mat> input, output, internals;
+        inputs_arr.getMatVector(input);
+        outputs_arr.getMatVector(output);
+        internals_arr.getMatVector(internals);
 
-        Mat xTs = input[0]->reshape(1, numSamplesTotal);
+        Mat xTs = input[0].reshape(1, numSamplesTotal);
         Mat oTs = output[0].reshape(1, numSamplesTotal);
         Mat hTs = produceH ? output[1].reshape(1, numSamplesTotal) : Mat();
         Mat hCurr = internals[0];
